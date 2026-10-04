@@ -198,6 +198,16 @@ $('discBtn').addEventListener('click', () => {
   setStatus('Disconnected.');
 });
 
+function errText(e) {
+  if (typeof e === 'string') return e;
+  if (e && typeof e.message === 'string' && e.message) return e.message;
+  try {
+    const j = JSON.stringify(e);
+    if (j && j !== '{}') return j;
+  } catch (_) {}
+  return String(e);
+}
+
 $('connectBtn').addEventListener('click', async () => {
   if (!wasmReady) { setStatus('RDP engine still loading…', true); return; }
   const workerUrl = $('workerUrl').value.trim().replace(/\/$/, '');
@@ -206,6 +216,23 @@ $('connectBtn').addEventListener('click', async () => {
   const password = $('password').value;
   if (!token) { setStatus('Enter the client token.', true); return; }
   if (!password) { setStatus('Enter the RDP password.', true); return; }
+
+  $('connectBtn').disabled = true;
+
+  // Pre-check: is the Windows runner actually connected?
+  setStatus('Checking backend…');
+  try {
+    const h = await (await fetch(workerUrl + '/health')).json();
+    if (!h.ok || !h.rdp) {
+      setStatus('Backend is offline — the Windows runner is not connected yet. Try again in a few minutes.', true);
+      $('connectBtn').disabled = false;
+      return;
+    }
+  } catch (e) {
+    setStatus('Cannot reach worker: ' + errText(e), true);
+    $('connectBtn').disabled = false;
+    return;
+  }
 
   let w, h;
   const res = $('res').value;
@@ -217,7 +244,6 @@ $('connectBtn').addEventListener('click', async () => {
   }
   canvas.width = w; canvas.height = h;
 
-  $('connectBtn').disabled = true;
   setStatus('Connecting…');
 
   const wsUrl = workerUrl.replace(/^http/, 'ws') +
@@ -239,9 +265,9 @@ $('connectBtn').addEventListener('click', async () => {
     document.body.classList.add('session');
     setStatus('');
     const info = await session.run();
-    setStatus('Session ended.', true);
+    setStatus('Session ended (' + errText(info && info.reason ? info.reason() : info) + ').', true);
   } catch (e) {
-    setStatus('Connection failed: ' + (e && e.message ? e.message : e), true);
+    setStatus('Connection failed: ' + errText(e), true);
   } finally {
     session = null;
     document.body.classList.remove('session');
