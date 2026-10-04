@@ -239,6 +239,7 @@ async def run_once():
         tls_mode = False  # True when proxy terminated TLS (RDCleanPath browser flow)
         tls_write_q = None
         tls_writer_task = None
+        tls_empty_reads = 0  # consecutive empty TLS reads (spurious vs real EOF)
 
         async def _read_exactly(rdr, n: int) -> bytes:
             """Read exactly n bytes from the stream reader, looping as needed."""
@@ -296,7 +297,7 @@ async def run_once():
             RDP (CredSSP, MCS, etc.) over the WebSocket; the relay encrypts
             towards the server via the TLS socket.
             """
-            nonlocal reader, writer, pump_task, gen, tls_mode, tls_write_q, tls_writer_task
+            nonlocal reader, writer, pump_task, gen, tls_mode, tls_write_q, tls_writer_task, tls_empty_reads
             x224_req = fields["x224"]
             print("relay: RDCleanPath client detected, handshaking (proxy terminates TLS)",
                   flush=True)
@@ -360,9 +361,11 @@ async def run_once():
                         pass
 
                 def on_tls_readable():
+                    nonlocal tls_empty_reads
                     try:
                         data = tls_sock.recv(65536)
                     except (ssl.SSLWantReadError, BlockingIOError):
+                        tls_empty_reads = 0
                         return
                     except Exception as e:
                         print(f"relay: TLS read failed: {e}", flush=True)
@@ -370,23 +373,18 @@ async def run_once():
                         asyncio.create_task(tls_notify_closed())
                         return
                     if not data:
-                        # Empty read MIGHT be EOF, but with TLS 1.3 the server
-                        # can send post-handshake messages (NewSessionTicket)
-                        # that yield no application data. Verify with MSG_PEEK:
-                        # a truly closed connection peeks empty; otherwise
-                        # it's a spurious wakeup — keep the session alive.
-                        try:
-                            peek = tls_sock.recv(1, socket.MSG_PEEK)
-                        except (ssl.SSLWantReadError, BlockingIOError):
-                            return  # not EOF, just no app data yet
-                        except Exception:
-                            peek = b""
-                        if peek:
-                            return  # spurious; connection still alive
+                        # An empty read on SSLSocket is USUALLY EOF, but we
+                        # have observed spurious empty reads on a live
+                        # connection (TLS 1.3 post-handshake). Require 3
+                        # consecutive empty reads before declaring EOF.
+                        tls_empty_reads += 1
+                        if tls_empty_reads < 3:
+                            return
                         print("relay: TLS EOF from RDP server", flush=True)
                         tls_cleanup()
                         asyncio.create_task(tls_notify_closed())
                     else:
+                        tls_empty_reads = 0
                         asyncio.create_task(ws.send(data))
 
                 async def tls_write_pump():
@@ -471,10 +469,11 @@ async def run_once():
 
         async def detach():
             nonlocal reader, writer, pump_task, gen, awaiting_first_frame
-            nonlocal tls_mode, tls_write_q, tls_writer_task
+            nonlocal tls_mode, tls_write_q, tls_writer_task, tls_empty_reads
             gen += 1  # invalidate the current pump's local_closed report
             awaiting_first_frame = False
             tls_mode = False
+            tls_empty_reads = 0
             if tls_writer_task is not None:
                 tls_writer_task.cancel()
                 tls_writer_task = None
