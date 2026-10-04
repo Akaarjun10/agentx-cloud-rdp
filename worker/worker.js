@@ -23,12 +23,26 @@
 
 const DO_NAME = "rdp-main";
 
+// CORS headers for browser fetch() calls (the web client page runs on a
+// different origin — GitHub Pages — and checks /health before connecting).
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
+
 export class RdpRelay {
   constructor(state, env) {
     this.state = state;
     this.env = env;
     this.uplink = null; // WebSocket to the current runner
     this.client = null; // WebSocket to the current client proxy
+    this.events = []; // TEMPORARY debug ring buffer (not persisted)
+  }
+
+  logEvent(dir, kind, size) {
+    this.events.push({ t: Date.now(), dir, kind, size });
+    if (this.events.length > 60) this.events.shift();
   }
 
   async fetch(req) {
@@ -53,9 +67,13 @@ export class RdpRelay {
       if (this.client) { try { this.client.close(1001, "runner replaced"); } catch (e) {} }
       this.client = null;
       this.uplink = server;
+      this.logEvent("uplink", "connect", 0);
 
       server.addEventListener("message", (ev) => this.onUplinkMessage(ev.data));
-      const drop = () => { if (this.uplink === server) this.uplink = null; };
+      const drop = () => {
+        this.logEvent("uplink", "drop", 0);
+        if (this.uplink === server) this.uplink = null;
+      };
       server.addEventListener("close", drop);
       server.addEventListener("error", drop);
 
@@ -64,7 +82,20 @@ export class RdpRelay {
 
     // ---- Public health: reveals only whether a runner is connected ----
     if (path === "/health") {
-      return Response.json({ ok: true, rdp: this.uplink !== null, ts: Date.now() });
+      if (req.method === "OPTIONS") {
+        return new Response(null, { headers: CORS });
+      }
+      return Response.json({ ok: true, rdp: this.uplink !== null, ts: Date.now() },
+        { headers: CORS });
+    }
+
+    // ---- Temporary debug: recent relay events (token-gated) ----
+    if (path === "/debug") {
+      if (url.searchParams.get("token") !== this.env.CLIENT_TOKEN) {
+        return new Response("unauthorized", { status: 401 });
+      }
+      return Response.json({ events: this.events, uplink: this.uplink !== null,
+        client: this.client !== null, ts: Date.now() }, { headers: CORS });
     }
 
     // ---- Client auth gate ----
@@ -89,11 +120,15 @@ export class RdpRelay {
       this.client = server;
 
       server.addEventListener("message", (ev) => {
+        const isBin = typeof ev.data !== "string";
+        this.logEvent("c2u", isBin ? "bin" : "txt",
+          isBin ? ev.data.byteLength : ev.data.length);
         if (this.uplink) {
           try { this.uplink.send(ev.data); } catch (e) {}
         }
       });
       const cleanup = (sendDetach) => {
+        this.logEvent("client", "close", 0);
         if (this.client === server) this.client = null;
         if (sendDetach && this.uplink) {
           try { this.uplink.send(JSON.stringify({ type: "detach" })); } catch (e) {}
@@ -115,6 +150,9 @@ export class RdpRelay {
   }
 
   onUplinkMessage(data) {
+    const isBin = typeof data !== "string";
+    this.logEvent("u2c", isBin ? "bin" : "txt",
+      isBin ? data.byteLength : data.length);
     if (typeof data === "string") {
       let msg;
       try { msg = JSON.parse(data); } catch (e) { return; }
