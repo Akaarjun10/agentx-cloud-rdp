@@ -214,6 +214,16 @@ async def run_once():
         gen = 0  # attach generation; stale pumps must not signal local_closed
         awaiting_first_frame = False
 
+        async def _read_exactly(rdr, n: int) -> bytes:
+            """Read exactly n bytes from the stream reader, looping as needed."""
+            buf = b""
+            while len(buf) < n:
+                chunk = await rdr.read(n - len(buf))
+                if not chunk:
+                    raise ConnectionError("EOF from RDP server")
+                buf += chunk
+            return buf
+
         async def tcp_pump(my_gen):
             try:
                 while True:
@@ -228,6 +238,32 @@ async def run_once():
             finally:
                 # Only report local_closed if this pump is still the current
                 # generation (a detach() cancels the pump without reporting).
+                if my_gen == gen:
+                    try:
+                        await ws.send(json.dumps({"type": "local_closed"}))
+                    except Exception:
+                        pass
+
+        async def tcp_pump_tls(my_gen):
+            """Pump complete TLS records (RDCleanPath sessions).
+
+            After the X.224 handshake, all RDP data flows inside TLS records.
+            Each record has a 5-byte header (type|version|length) followed by
+            the payload. We read exactly one complete record per iteration and
+            send it as a single WebSocket message, so the client's frame
+            reader never sees a partial record ("not enough bytes").
+            """
+            try:
+                while True:
+                    hdr = await _read_exactly(reader, 5)
+                    rec_len = int.from_bytes(hdr[3:5], "big")
+                    payload = await _read_exactly(reader, rec_len)
+                    await ws.send(hdr + payload)
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            finally:
                 if my_gen == gen:
                     try:
                         await ws.send(json.dumps({"type": "local_closed"}))
@@ -288,8 +324,8 @@ async def run_once():
                 reader = writer = None
                 return False
             gen += 1
-            pump_task = asyncio.create_task(tcp_pump(gen))
-            print("relay: RDCleanPath handshake done, session bridged", flush=True)
+            pump_task = asyncio.create_task(tcp_pump_tls(gen))
+            print("relay: RDCleanPath handshake done, session bridged (TLS framing)", flush=True)
             return True
 
         async def handle_first_frame(data: bytes):
