@@ -202,14 +202,24 @@ function errText(e) {
   if (typeof e === 'string') return e;
   // IronRDP WASM IronError: extract kind + backtrace instead of raw pointer
   try {
-    if (e && typeof e.kind === 'function' && typeof e.backtrace === 'function') {
-      const kinds = ['General','WrongPassword','LogonFailure','AccessDenied','RDCleanPath','ProxyConnect','NegotiationFailure'];
-      const k = e.kind();
-      const bt = e.backtrace();
-      // backtrace first line is the most useful
-      const firstLine = (bt || '').split('\n')[0].slice(0, 300);
-      return `IronRDP [${kinds[k] || k}]: ${firstLine}`;
+    const ctor = e && e.constructor && e.constructor.name ? e.constructor.name : '';
+    // Try IronError methods directly (wasm-bindgen objects)
+    if (ctor === 'IronError' || (e && ('__wbg_ptr' in Object(e)))) {
+      try {
+        const k = e.kind();
+        const kinds = ['General','WrongPassword','LogonFailure','AccessDenied','RDCleanPath','ProxyConnect','NegotiationFailure'];
+        let msg = '';
+        try { msg = (e.backtrace() || '').split('\n')[0].slice(0, 400); } catch (_) {}
+        // Also try rdcleanpathDetails for more info
+        let det = '';
+        try {
+          const d = e.rdcleanpathDetails && e.rdcleanpathDetails();
+          if (d) det = ' | details: ' + JSON.stringify(d).slice(0, 200);
+        } catch (_) {}
+        return `IronRDP [${kinds[k] || k}]${ctor ? ' (' + ctor + ')' : ''}: ${msg}${det}`;
+      } catch (_) {}
     }
+    if (ctor && ctor !== 'Object') return `${ctor}: ${String(e)}`;
   } catch (_) {}
   if (e && typeof e.message === 'string' && e.message) return e.message;
   try {
