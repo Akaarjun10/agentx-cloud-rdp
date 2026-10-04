@@ -6,11 +6,15 @@ Cloudflare Durable Object over one outbound WebSocket.
 Two client modes, auto-detected from the first binary frame after attach:
   - RDCleanPath (browser WASM client, ironrdp-web): the first frame is a
     DER-encoded RDCleanPathPdu (SEQUENCE, version 3390) wrapping the client's
-    X.224 Connection Request. The relay performs the RDCleanPath handshake:
-    forwards the X.224 to 3389, completes a TLS handshake to capture the
-    server certificate, and replies with the DER-encoded RDCleanPath response
-    (X.224 confirm + server cert chain). Afterwards it is a plain byte pump
-    while the browser does TLS + CredSSP end-to-end with the RDP server.
+    X.224 Connection Request. The relay performs the RDCleanPath handshake
+    like Devolutions Gateway: it sends the X.224 to 127.0.0.1:3389, completes
+    the TLS handshake itself (TERMINATING TLS at the proxy), and replies with
+    the DER-encoded RDCleanPath response (X.224 confirm + server cert chain).
+    Afterwards it pumps plaintext: the browser speaks plain RDP (CredSSP and
+    everything after) over the WebSocket; the relay encrypts towards the RDP
+    server through the live TLS socket. ironrdp-web never does TLS itself in
+    this flow — it marks the security upgrade as done after the RDCleanPath
+    response.
   - Raw RDP (mstsc via client/rdp_client_proxy.py): the first frame is a
     TPKT X.224 request. The relay opens TCP immediately and pumps bytes.
 
@@ -139,14 +143,31 @@ def _recvall(sock, n: int) -> bytes:
     return buf
 
 
+def _recvall_tpkt_blocking(sock) -> bytes:
+    """Read one TPKT frame from a blocking socket."""
+    hdr = _recvall(sock, 4)
+    if hdr[0] != 0x03:  # TPKT version
+        raise ValueError("RDP server did not answer X.224 with TPKT")
+    total = int.from_bytes(hdr[2:4], "big")
+    if total < 4 or total > 65535:
+        raise ValueError("bad TPKT length in X.224 response")
+    return hdr + _recvall(sock, total - 4)
+
+
 def rdcleanpath_handshake(x224_req: bytes, timeout: float = 15.0):
     """
-    Perform the proxy side of the RDCleanPath handshake on a throwaway
-    connection: send the client's X.224, read the server's X.224 confirm,
-    then complete a TLS handshake to capture the server certificate.
-    Returns (x224_resp, cert_der). Raises on failure.
-    Runs in a thread (blocking sockets); the session itself uses a fresh
-    connection afterwards so the client owns the TLS handshake end-to-end.
+    Perform the proxy side of the RDCleanPath handshake on a blocking socket
+    (runs in a thread): send the client's X.224, read the server's X.224
+    confirm, then complete the TLS handshake.
+
+    IMPORTANT: the proxy TERMINATES TLS here (this is the RDCleanPath design,
+    matching Devolutions Gateway: ironrdp-web's client never does TLS itself;
+    it marks the security upgrade as done and speaks plaintext RDP — CredSSP
+    and everything after — over the WebSocket, while the proxy encrypts
+    towards the RDP server).
+
+    Returns (x224_resp, cert_der, tls_socket) with the TLS handshake complete.
+    The caller wraps the socket with asyncio for the session. Raises on failure.
     """
     import socket
     import ssl
@@ -154,13 +175,7 @@ def rdcleanpath_handshake(x224_req: bytes, timeout: float = 15.0):
     s = socket.create_connection((RDP_HOST, RDP_PORT), timeout=timeout)
     try:
         s.sendall(x224_req)
-        hdr = _recvall(s, 4)
-        if hdr[0] != 0x03:  # TPKT version
-            raise ValueError("RDP server did not answer X.224 with TPKT")
-        total = int.from_bytes(hdr[2:4], "big")
-        if total < 4 or total > 65535:
-            raise ValueError("bad TPKT length in X.224 response")
-        x224_resp = hdr + _recvall(s, total - 4)
+        x224_resp = _recvall_tpkt_blocking(s)
 
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
@@ -169,14 +184,20 @@ def rdcleanpath_handshake(x224_req: bytes, timeout: float = 15.0):
         try:
             tls.do_handshake()
             cert_der = tls.getpeercert(binary_form=True)
-        finally:
+        except Exception:
             try:
-                tls.close()  # also closes the underlying socket
+                tls.close()
             except Exception:
                 pass
+            raise
         if not cert_der:
+            try:
+                tls.close()
+            except Exception:
+                pass
             raise ValueError("RDP server presented no certificate")
-        return x224_resp, cert_der
+        tls.setblocking(False)
+        return x224_resp, cert_der, tls
     except Exception:
         try:
             s.close()
@@ -244,46 +265,6 @@ async def run_once():
                     except Exception:
                         pass
 
-        async def tcp_pump_tls(my_gen):
-            """Pump complete TLS records (RDCleanPath sessions).
-
-            After the X.224 handshake, all RDP data flows inside TLS records.
-            Each record has a 5-byte header (type|version|length) followed by
-            the payload. We read exactly one complete record per iteration and
-            send it as a single WebSocket message, so the client's frame
-            reader never sees a partial record ("not enough bytes").
-            """
-            n_records = 0
-            n_bytes = 0
-            try:
-                while True:
-                    hdr = await _read_exactly(reader, 5)
-                    rec_len = int.from_bytes(hdr[3:5], "big")
-                    payload = await _read_exactly(reader, rec_len)
-                    await ws.send(hdr + payload)
-                    n_records += 1
-                    n_bytes += 5 + rec_len
-                    if n_records == 1:
-                        # Header only (type|version|length); never log payloads.
-                        print(f"relay: TLS pump first record "
-                              f"type={hdr[0]} ver={hdr[1]:02x}{hdr[2]:02x} len={rec_len}",
-                              flush=True)
-            except asyncio.CancelledError:
-                print(f"relay: TLS pump cancelled after {n_records} records / {n_bytes} bytes",
-                      flush=True)
-            except Exception as e:
-                # THIS is the diagnostic that matters: if the RDP server
-                # closes the TCP connection, the client sees EOF ("not enough
-                # bytes"). Log exactly why the pump died.
-                print(f"relay: TLS pump died after {n_records} records / {n_bytes} bytes: "
-                      f"{type(e).__name__}: {e}", flush=True)
-            finally:
-                if my_gen == gen:
-                    try:
-                        await ws.send(json.dumps({"type": "local_closed"}))
-                    except Exception:
-                        pass
-
         async def start_pump():
             nonlocal reader, writer, pump_task, gen
             if writer is not None:
@@ -302,12 +283,19 @@ async def run_once():
             return True
 
         async def do_rdcleanpath(fields) -> bool:
-            """Run the RDCleanPath handshake, then bridge a fresh connection."""
+            """Run the RDCleanPath handshake, then bridge the TLS-terminated session.
+
+            The proxy terminates TLS with the RDP server (RDCleanPath design).
+            Afterwards it is a plain byte pump: the browser speaks plaintext
+            RDP (CredSSP, MCS, etc.) over the WebSocket; the relay encrypts
+            towards the server via the TLS socket.
+            """
             nonlocal reader, writer, pump_task, gen
             x224_req = fields["x224"]
-            print("relay: RDCleanpath client detected, handshaking", flush=True)
+            print("relay: RDCleanPath client detected, handshaking (proxy terminates TLS)",
+                  flush=True)
             try:
-                x224_resp, cert_der = await asyncio.to_thread(
+                x224_resp, cert_der, tls_sock = await asyncio.to_thread(
                     rdcleanpath_handshake, x224_req
                 )
             except Exception as e:
@@ -324,16 +312,21 @@ async def run_once():
                 await ws.send(resp)
             except Exception as e:
                 print(f"relay: failed to send RDCleanPath response: {e}", flush=True)
+                try:
+                    tls_sock.close()
+                except Exception:
+                    pass
                 return False
-            # Fresh connection for the actual session: replay the X.224 so the
-            # server is waiting for the client's TLS handshake, then pump bytes.
+            # Wrap the live TLS socket for asyncio: reads come back decrypted,
+            # writes go out encrypted. Plain byte pump from here on.
             try:
-                reader, writer = await asyncio.open_connection(RDP_HOST, RDP_PORT)
-                writer.write(x224_req)
-                await writer.drain()
-                await _read_tpkt_async(reader)  # server confirm; discard
+                reader, writer = await asyncio.open_connection(sock=tls_sock)
             except Exception as e:
-                print(f"relay: session connection failed: {e}", flush=True)
+                print(f"relay: failed to wrap TLS socket: {e}", flush=True)
+                try:
+                    tls_sock.close()
+                except Exception:
+                    pass
                 try:
                     await ws.send(json.dumps({"type": "local_closed"}))
                 except Exception:
@@ -341,8 +334,9 @@ async def run_once():
                 reader = writer = None
                 return False
             gen += 1
-            pump_task = asyncio.create_task(tcp_pump_tls(gen))
-            print("relay: RDCleanPath handshake done, session bridged (TLS framing)", flush=True)
+            pump_task = asyncio.create_task(tcp_pump(gen))
+            print("relay: RDCleanPath handshake done, session bridged (TLS terminated at relay)",
+                  flush=True)
             return True
 
         async def handle_first_frame(data: bytes):
