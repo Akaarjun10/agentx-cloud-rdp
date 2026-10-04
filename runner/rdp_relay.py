@@ -332,11 +332,18 @@ async def run_once():
                 reader = writer = None
 
         async def heartbeat():
-            # Periodic liveness marker in the log + keeps the DO active.
+            # Periodic liveness marker in the log + application-level keepalive.
+            # Sends {"type":"ping"} over the WS every 30s so the connection
+            # never goes idle (Cloudflare severs idle WebSockets). The DO
+            # ignores unknown text types; the activity alone keeps it alive.
             # Runs until cancelled when run_once() exits.
             try:
                 while True:
-                    await asyncio.sleep(60)
+                    await asyncio.sleep(30)
+                    try:
+                        await ws.send(json.dumps({"type": "ping"}))
+                    except Exception:
+                        pass
                     print("relay: heartbeat (uplink alive)", flush=True)
             except asyncio.CancelledError:
                 pass
