@@ -1,0 +1,36 @@
+name: rdp-watchdog
+
+# Safety net for the self-chaining windows-rdp workflow. Every 30 minutes,
+# if no windows-rdp run is currently in progress, dispatch one. The dispatch
+# dedupe inside windows-rdp.yml guarantees this can never grow into a swarm.
+#
+# NOTE: GitHub pauses scheduled workflows on repos with 60 days of no
+# activity — the .heartbeat commit in windows-rdp.yml keeps the repo active.
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Re-dispatch if the chain is broken
+        run: |
+          repo="${{ github.repository }}"
+          headers=(-H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" -H "Accept: application/vnd.github+json")
+          active=$(curl -sf "${headers[@]}" \
+            "https://api.github.com/repos/$repo/actions/runs?status=in_progress&per_page=20" | \
+            jq '[.workflow_runs[] | select(.name == "windows-rdp")] | length')
+          if [ "${active:-0}" -eq 0 ]; then
+            echo "no windows-rdp run in progress — dispatching a fresh one"
+            curl -sf -X POST "${headers[@]}" \
+              "https://api.github.com/repos/$repo/actions/workflows/windows-rdp.yml/dispatches" \
+              -d '{"ref":"${{ github.ref_name }}"}' && echo "dispatched"
+          else
+            echo "chain alive ($active run(s) in progress) — nothing to do"
+          fi

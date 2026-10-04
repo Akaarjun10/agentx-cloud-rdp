@@ -1,0 +1,169 @@
+name: windows-rdp
+
+# AgentX cloud RDP PoC (EXPERIMENTAL).
+#
+# Runs a Windows runner with RDP enabled and bridges port 3389 to a
+# Cloudflare Durable Object (singleton "rdp-main") over ONE outbound
+# WebSocket. Clients always use ONE stable Worker URL; the DO relays raw
+# RDP bytes between the client proxy and whichever runner is currently up.
+#
+# Chrome state (full browser profile: cookies, logins, history, extensions,
+# open tabs) plus a persist folder are snapshotted to the Actions cache at
+# every handoff, so the successor runner restores everything before it
+# opens its relay uplink.
+#
+# Restarts are SELF-CHAINED: each run snapshots state, then dispatches its
+# own successor via the GitHub API, just before the 6h job kill. A watchdog
+# (rdp-watchdog, every 30 min) re-dispatches if the chain ever breaks.
+#
+# NOTE: no `concurrency` group on purpose — overlapping runs are required
+# for the handoff.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 355 # hard kill stays under GitHub's 6h job limit
+    permissions:
+      contents: write # heartbeat commit
+      actions: write  # self-dispatch of the successor run
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Heartbeat (keeps the repo active)
+        shell: pwsh
+        run: |
+          git config user.name "agentx-bot"
+          git config user.email "agentx-bot@users.noreply.github.com"
+          (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") | Out-File -Encoding ascii .heartbeat
+          git add .heartbeat
+          git commit -m "heartbeat $((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))" 2>$null | Out-Null
+          git push 2>$null | Out-Null
+
+      - name: Restore Chrome state from cache
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\rdp-state\chrome-state.zip
+          key: rdp-chrome-${{ github.run_id }}
+          restore-keys: |
+            rdp-chrome-
+
+      - name: Unpack Chrome state
+        shell: pwsh
+        run: ./runner/snapshot.ps1 -Mode Restore
+
+      - name: Enable RDP
+        shell: pwsh
+        run: ./runner/enable_rdp.ps1
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+
+      - name: Launch Chrome (restored profile)
+        shell: pwsh
+        run: |
+          $profile = "C:\rdp-state\ChromeProfile"
+          New-Item -ItemType Directory -Force -Path $profile | Out-Null
+          New-Item -ItemType Directory -Force -Path "C:\rdp-persist" | Out-Null
+          $chrome = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+          if (-not (Test-Path $chrome)) { throw "Chrome not found at $chrome" }
+          $args = @(
+            "--user-data-dir=`"$profile`"",
+            "--restore-last-session",
+            "--no-first-run",
+            "--disable-features=Translate",
+            "--remote-debugging-port=9222",
+            "--remote-debugging-address=127.0.0.1",
+            "about:blank"
+          )
+          Start-Process $chrome -ArgumentList $args -WindowStyle Minimized
+          Start-Sleep 8
+          $p = Get-Process chrome -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($p) { Write-Host "Chrome is up (PID $($p.Id)) with profile $profile" }
+          else { throw "Chrome did not start" }
+
+      - name: Connect RDP relay to Cloudflare Durable Object
+        shell: pwsh
+        run: |
+          pip install --quiet websockets
+          if (Test-Path C:\rdp-state\relay.log) { Remove-Item C:\rdp-state\relay.log }
+          $proc = Start-Process python -ArgumentList "runner/rdp_relay.py" `
+            -RedirectStandardOutput "C:\rdp-state\relay.log" `
+            -RedirectStandardError "C:\rdp-state\relay.err.log" `
+            -PassThru -WindowStyle Hidden
+          $proc.Id | Out-File -Encoding ascii C:\rdp-state\relay.pid
+          $ok = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep 4
+            if ((Test-Path C:\rdp-state\relay.log) -and `
+                (Select-String -Path C:\rdp-state\relay.log -Pattern "connected to DO" -Quiet)) { $ok = $true; break }
+            if ($proc.HasExited) { break }
+          }
+          if (-not $ok) {
+            Write-Host "relay never connected. stdout:"; Get-Content C:\rdp-state\relay.log -ErrorAction SilentlyContinue
+            Write-Host "stderr:"; Get-Content C:\rdp-state\relay.err.log -ErrorAction SilentlyContinue
+            throw "relay failed to connect"
+          }
+          Write-Host "relay uplink established"
+          # The DO should now report RDP online on the public /health.
+          $healthOk = $false
+          for ($i = 0; $i -lt 12; $i++) {
+            try {
+              $h = Invoke-RestMethod -Uri "$env:WORKER_URL/health" -TimeoutSec 10
+              if ($h.rdp -eq $true) { $healthOk = $true; break }
+            } catch {}
+            Start-Sleep 5
+          }
+          if (-not $healthOk) { throw "Worker health never reported rdp=true" }
+          Write-Host "Worker reports RDP online"
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
+
+      - name: Hold until handoff
+        shell: pwsh
+        run: |
+          $holdSeconds = 19000  # ~5h17m: leaves ~35min for snapshot + cache upload + dispatch
+          $deadline = (Get-Date).AddSeconds($holdSeconds)
+          $relayPid = Get-Content C:\rdp-state\relay.pid -ErrorAction SilentlyContinue
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep 300
+            $relayAlive = $false
+            if ($relayPid) { $relayAlive = $null -ne (Get-Process -Id $relayPid -ErrorAction SilentlyContinue) }
+            $rdpUp = (Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue).TcpTestSucceeded
+            if (-not $relayAlive -and -not $rdpUp) {
+              Write-Host "Relay and RDP both down — handing off to a successor now"
+              break
+            }
+          }
+          Write-Host "Hold complete, proceeding to snapshot"
+
+      - name: Snapshot Chrome state
+        shell: pwsh
+        run: ./runner/snapshot.ps1 -Mode Snapshot
+
+      - name: Save Chrome state to cache
+        uses: actions/cache/save@v4
+        with:
+          path: C:\rdp-state\chrome-state.zip
+          key: rdp-chrome-${{ github.run_id }}
+
+      - name: Dispatch successor run
+        shell: pwsh
+        run: |
+          $repo = "${{ github.repository }}"
+          $headers = @{ Authorization = "Bearer ${{ secrets.GITHUB_TOKEN }}"; Accept = "application/vnd.github+json" }
+          $me = [long]"${{ github.run_id }}"
+          $runs = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$repo/actions/runs?status=in_progress&per_page=20"
+          $newer = @($runs.workflow_runs | Where-Object { $_.name -eq "windows-rdp" -and [long]$_.id -gt $me }).Count
+          if ($newer -gt 0) {
+            Write-Host "newer windows-rdp run already in progress; skipping dispatch (dedupe)"
+          } else {
+            $body = @{ ref = "${{ github.ref_name }}" } | ConvertTo-Json
+            Invoke-RestMethod -Method Post -Headers $headers `
+              -Uri "https://api.github.com/repos/$repo/actions/workflows/windows-rdp.yml/dispatches" `
+              -Body $body -ContentType "application/json"
+            Write-Host "successor dispatched"
+          }
+          Write-Host "Run exiting before the 6h limit"
