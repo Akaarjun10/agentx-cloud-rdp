@@ -355,7 +355,8 @@ async def run_once():
                         except Exception:
                             pass
                         try:
-                            await ws.send(json.dumps({"type": "local_closed"}))
+                            await ws.send(json.dumps({"type": "local_closed",
+                                                     "from": "tls_pump"}))
                         except Exception:
                             pass
 
