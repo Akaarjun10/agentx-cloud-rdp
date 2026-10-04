@@ -550,4 +550,9 @@ async def main():
 
 
 if __name__ == "__main__":
+    # On Windows, asyncio defaults to ProactorEventLoop, which does NOT
+    # support add_reader/add_writer (needed to drive the pre-handshaked
+    # SSLSocket for RDCleanPath). Use the selector loop instead.
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())
