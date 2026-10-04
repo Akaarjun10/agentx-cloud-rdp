@@ -153,9 +153,19 @@ export class RdpRelay {
 
   onUplinkMessage(data) {
     const isBin = typeof data !== "string";
+    let content;
+    if (!isBin) {
+      content = data.slice(0, 200);
+      // Capture relay log lines for diagnostics
+      try {
+        const msg = JSON.parse(data);
+        if (msg.type === "log_line" && msg.msg) {
+          content = "LOG: " + msg.msg.slice(0, 160);
+        }
+      } catch (e) {}
+    }
     this.logEvent("u2c", isBin ? "bin" : "txt",
-      isBin ? data.byteLength : data.length,
-      isBin ? undefined : data.slice(0, 120));
+      isBin ? data.byteLength : data.length, content);
     if (typeof data === "string") {
       let msg;
       try { msg = JSON.parse(data); } catch (e) { return; }
