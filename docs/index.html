@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>AgentX Cloud RDP</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; background: #0b0e14; color: #e6e6e6;
+    font-family: system-ui, -apple-system, sans-serif; overflow: hidden; }
+  #login { position: fixed; inset: 0; display: flex; align-items: center;
+    justify-content: center; padding: 20px; z-index: 10; }
+  #login .card { width: 100%; max-width: 380px; background: #141a26;
+    border: 1px solid #232d42; border-radius: 14px; padding: 26px 22px; }
+  #login h1 { font-size: 20px; margin-bottom: 4px; }
+  #login p.sub { font-size: 13px; color: #8b93a7; margin-bottom: 18px; }
+  #login label { display: block; font-size: 12px; color: #8b93a7;
+    margin: 12px 0 5px; }
+  #login input, #login select { width: 100%; padding: 11px 12px; font-size: 15px;
+    background: #0b0e14; border: 1px solid #2a3550; border-radius: 8px;
+    color: #e6e6e6; }
+  #login input:focus, #login select:focus { outline: none; border-color: #4d7cfe; }
+  #connectBtn { width: 100%; margin-top: 20px; padding: 13px; font-size: 16px;
+    font-weight: 600; background: #2f6bff; color: #fff; border: none;
+    border-radius: 10px; cursor: pointer; }
+  #connectBtn:disabled { opacity: .5; }
+  #status { margin-top: 14px; font-size: 13px; color: #8b93a7; min-height: 18px;
+    word-break: break-word; }
+  #status.err { color: #ff7a7a; }
+  #stage { position: fixed; inset: 0; display: none; }
+  #stage.on { display: block; }
+  #rdp { position: absolute; inset: 0; width: 100%; height: 100%;
+    touch-action: none; cursor: default; }
+  #toolbar { position: fixed; top: 8px; right: 8px; z-index: 5; display: none;
+    gap: 8px; }
+  #stage.on ~ #toolbar, body.session #toolbar { display: flex; }
+  #toolbar button { padding: 9px 13px; font-size: 13px; background: #1c2436ee;
+    color: #e6e6e6; border: 1px solid #2a3550; border-radius: 8px; cursor: pointer; }
+  #kbd { position: fixed; bottom: 0; left: 0; width: 10px; height: 10px;
+    opacity: 0; border: none; }
+</style>
+</head>
+<body>
+<div id="login">
+  <div class="card">
+    <h1>AgentX Cloud RDP</h1>
+    <p class="sub">Your Windows desktop, right in the browser.</p>
+    <label>Worker URL</label>
+    <input id="workerUrl" value="https://agentx-rdp-relay.rdpbro.workers.dev" autocomplete="off">
+    <label>Client token</label>
+    <input id="token" type="password" placeholder="CLIENT_TOKEN" autocomplete="off">
+    <label>Username</label>
+    <input id="username" value="runneradmin" autocomplete="off">
+    <label>Password</label>
+    <input id="password" type="password" placeholder="RDP password" autocomplete="off">
+    <label>Resolution</label>
+    <select id="res">
+      <option value="fit">Fit this device</option>
+      <option value="1280x720" selected>1280 × 720</option>
+      <option value="1920x1080">1920 × 1080</option>
+    </select>
+    <button id="connectBtn">Connect</button>
+    <div id="status"></div>
+  </div>
+</div>
+<div id="stage"><canvas id="rdp"></canvas></div>
+<div id="toolbar">
+  <button id="kbdBtn">⌨️ Keyboard</button>
+  <button id="discBtn">Disconnect</button>
+</div>
+<input id="kbd" autocomplete="off" autocapitalize="off" spellcheck="false">
+
+<script type="module">
+import init, * as ird from './ironrdp_web.js';
+
+const $ = id => document.getElementById(id);
+const statusEl = $('status');
+const setStatus = (t, err) => {
+  statusEl.textContent = t || '';
+  statusEl.classList.toggle('err', !!err);
+};
+
+// Key code -> Windows scancode (from IronRDP's scancode table)
+const KEYCODE_TO_SCANCODE = {"Escape": 1, "Digit1": 2, "Digit2": 3, "Digit3": 4, "Digit4": 5, "Digit5": 6, "Digit6": 7, "Digit7": 8, "Digit8": 9, "Digit9": 10, "Digit0": 11, "Minus": 12, "Equal": 13, "Backspace": 14, "Tab": 15, "KeyQ": 16, "KeyW": 17, "KeyE": 18, "KeyR": 19, "KeyT": 20, "KeyY": 21, "KeyU": 22, "KeyI": 23, "KeyO": 24, "KeyP": 25, "BracketLeft": 26, "BracketRight": 27, "Enter": 28, "ControlLeft": 29, "KeyA": 30, "KeyS": 31, "KeyD": 32, "KeyF": 33, "KeyG": 34, "KeyH": 35, "KeyJ": 36, "KeyK": 37, "KeyL": 38, "Semicolon": 39, "Quote": 40, "Backquote": 41, "ShiftLeft": 42, "Backslash": 43, "KeyZ": 44, "KeyX": 45, "KeyC": 46, "KeyV": 47, "KeyB": 48, "KeyN": 49, "KeyM": 50, "Comma": 51, "Period": 52, "Slash": 53, "ShiftRight": 54, "NumpadMultiply": 55, "AltLeft": 56, "Space": 57, "CapsLock": 58, "F1": 59, "F2": 60, "F3": 61, "F4": 62, "F5": 63, "F6": 64, "F7": 65, "F8": 66, "F9": 67, "F10": 68, "Pause": 57414, "ScrollLock": 70, "Numpad7": 71, "Numpad8": 72, "Numpad9": 73, "NumpadSubtract": 74, "Numpad4": 75, "Numpad5": 76, "Numpad6": 77, "NumpadAdd": 78, "Numpad1": 79, "Numpad2": 80, "Numpad3": 81, "Numpad0": 82, "NumpadDecimal": 83, "IntlBackslash": 86, "F11": 87, "F12": 88, "NumpadEqual": 89, "F13": 100, "F14": 101, "F15": 102, "F16": 103, "F17": 104, "F18": 105, "F19": 106, "F20": 107, "F21": 108, "F22": 109, "F23": 110, "KanaMode": 112, "Lang2": 113, "Lang1": 114, "IntlRo": 115, "F24": 118, "Convert": 121, "NonConvert": 123, "IntlYen": 125, "NumpadComma": 126, "MediaTrackPrevious": 57360, "MediaTrackNext": 57369, "NumpadEnter": 57372, "ControlRight": 57373, "LaunchApp2": 57377, "MediaPlayPause": 57378, "MediaStop": 57380, "BrowserHome": 57394, "NumpadDivide": 57397, "PrintScreen": 57399, "AltRight": 57400, "NumLock": 57413, "Home": 57415, "ArrowUp": 57416, "PageUp": 57417, "ArrowLeft": 57419, "ArrowRight": 57421, "End": 57423, "ArrowDown": 57424, "PageDown": 57425, "Insert": 57426, "Delete": 57427, "ContextMenu": 57437, "Power": 57438, "BrowserSearch": 57445, "BrowserFavorites": 57446, "BrowserRefresh": 57447, "BrowserStop": 57448, "BrowserForward": 57449, "BrowserBack": 57450, "LaunchApp1": 57451, "LaunchMail": 57452, "MediaSelect": 57453};
+
+let session = null;
+let wasmReady = false;
+
+setStatus('Loading RDP engine…');
+try {
+  await init();
+  wasmReady = true;
+  setStatus('');
+} catch (e) {
+  setStatus('Failed to load RDP engine: ' + e, true);
+}
+
+function sendEvents(events) {
+  if (!session) return;
+  const tx = new ird.InputTransaction();
+  for (const ev of events) tx.addEvent(ev);
+  session.applyInputs(tx);
+}
+
+function canvasPos(evt) {
+  const r = $('rdp').getBoundingClientRect();
+  const dw = $('rdp').width, dh = $('rdp').height;
+  return {
+    x: Math.max(0, Math.min(dw - 1, Math.round((evt.clientX - r.left) / r.width * dw))),
+    y: Math.max(0, Math.min(dh - 1, Math.round((evt.clientY - r.top) / r.height * dh))),
+  };
+}
+
+// ---- mouse ----
+const canvas = $('rdp');
+canvas.addEventListener('mousedown', e => {
+  const p = canvasPos(e);
+  sendEvents([ird.DeviceEvent.mouseMove(p.x, p.y),
+              ird.DeviceEvent.mouseButtonPressed(e.button)]);
+});
+window.addEventListener('mouseup', e => {
+  sendEvents([ird.DeviceEvent.mouseButtonReleased(e.button)]);
+});
+canvas.addEventListener('mousemove', e => {
+  if (e.buttons === 0 && !touchMode) return;
+  const p = canvasPos(e);
+  sendEvents([ird.DeviceEvent.mouseMove(p.x, p.y)]);
+});
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  const vertical = Math.abs(e.deltaY) >= Math.abs(e.deltaX);
+  const amount = Math.round(vertical ? e.deltaY : e.deltaX);
+  sendEvents([ird.DeviceEvent.wheelRotations(vertical, amount, 0)]);
+}, { passive: false });
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+// ---- touch -> mouse ----
+let touchMode = false;
+let lastTouch = null;
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  touchMode = true;
+  const t = e.changedTouches[0];
+  const p = canvasPos(t);
+  lastTouch = p;
+  sendEvents([ird.DeviceEvent.mouseMove(p.x, p.y),
+              ird.DeviceEvent.mouseButtonPressed(0)]);
+}, { passive: false });
+canvas.addEventListener('touchmove', e => {
+  e.preventDefault();
+  const t = e.changedTouches[0];
+  const p = canvasPos(t);
+  lastTouch = p;
+  sendEvents([ird.DeviceEvent.mouseMove(p.x, p.y)]);
+}, { passive: false });
+canvas.addEventListener('touchend', e => {
+  e.preventDefault();
+  sendEvents([ird.DeviceEvent.mouseButtonReleased(0)]);
+  setTimeout(() => { touchMode = false; }, 300);
+}, { passive: false });
+
+// ---- keyboard ----
+function sendKey(evt) {
+  evt.preventDefault();
+  const isDown = evt.type === 'keydown';
+  const sc = KEYCODE_TO_SCANCODE[evt.code];
+  const keyEv = isDown ? ird.DeviceEvent.keyPressed : ird.DeviceEvent.keyReleased;
+  const uniEv = isDown ? ird.DeviceEvent.unicodePressed : ird.DeviceEvent.unicodeReleased;
+  if (sc !== undefined && !evt.repeat) {
+    sendEvents([keyEv(sc)]);
+  } else if (evt.key && evt.key.length === 1) {
+    sendEvents([uniEv(evt.key)]);
+  }
+}
+window.addEventListener('keydown', e => { if (session) sendKey(e); });
+window.addEventListener('keyup', e => { if (session) sendKey(e); });
+$('kbd').addEventListener('keydown', sendKey);
+$('kbd').addEventListener('keyup', sendKey);
+$('kbdBtn').addEventListener('click', () => { $('kbd').focus(); });
+
+// ---- cursor ----
+function setCursor(style, data, hx, hy) {
+  if (style === 'url' && data) {
+    canvas.style.cursor = `url(${data}) ${hx || 0} ${hy || 0}, default`;
+  } else if (style === 'none') {
+    canvas.style.cursor = 'none';
+  } else {
+    canvas.style.cursor = 'default';
+  }
+}
+
+$('discBtn').addEventListener('click', () => {
+  try { session && session.shutdown(); } catch (e) {}
+  session = null;
+  document.body.classList.remove('session');
+  $('stage').classList.remove('on');
+  $('login').style.display = 'flex';
+  setStatus('Disconnected.');
+});
+
+$('connectBtn').addEventListener('click', async () => {
+  if (!wasmReady) { setStatus('RDP engine still loading…', true); return; }
+  const workerUrl = $('workerUrl').value.trim().replace(/\/$/, '');
+  const token = $('token').value.trim();
+  const username = $('username').value.trim();
+  const password = $('password').value;
+  if (!token) { setStatus('Enter the client token.', true); return; }
+  if (!password) { setStatus('Enter the RDP password.', true); return; }
+
+  let w, h;
+  const res = $('res').value;
+  if (res === 'fit') {
+    w = Math.min(1920, Math.max(640, window.innerWidth));
+    h = Math.min(1080, Math.max(400, window.innerHeight));
+  } else {
+    [w, h] = res.split('x').map(Number);
+  }
+  canvas.width = w; canvas.height = h;
+
+  $('connectBtn').disabled = true;
+  setStatus('Connecting…');
+
+  const wsUrl = workerUrl.replace(/^http/, 'ws') +
+    '/rdp-client?token=' + encodeURIComponent(token);
+  try {
+    const sb = new ird.SessionBuilder();
+    sb.username(username);
+    sb.password(password);
+    sb.destination('127.0.0.1');
+    sb.proxyAddress(wsUrl);
+    sb.authToken(token);
+    sb.renderCanvas(canvas);
+    sb.setCursorStyleCallbackContext(null);
+    sb.setCursorStyleCallback(setCursor);
+    sb.desktopSize(new ird.DesktopSize(w, h));
+    session = await sb.connect();
+    $('login').style.display = 'none';
+    $('stage').classList.add('on');
+    document.body.classList.add('session');
+    setStatus('');
+    const info = await session.run();
+    setStatus('Session ended.', true);
+  } catch (e) {
+    setStatus('Connection failed: ' + (e && e.message ? e.message : e), true);
+  } finally {
+    session = null;
+    document.body.classList.remove('session');
+    $('stage').classList.remove('on');
+    $('login').style.display = 'flex';
+    $('connectBtn').disabled = false;
+  }
+});
+</script>
+</body>
+</html>
