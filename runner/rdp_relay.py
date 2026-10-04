@@ -336,17 +336,24 @@ async def run_once():
                 # Keep tls_sock in blocking mode (as returned by the handshake
                 # thread). Do NOT set non-blocking.
                 async def tls_read_pump():
+                    close_reason = "unknown"
                     try:
                         while True:
                             data = await asyncio.to_thread(tls_sock.recv, 65536)
                             if not data:
+                                close_reason = "eof"
                                 print("relay: TLS EOF from RDP server", flush=True)
                                 break
                             try:
                                 await ws.send(data)
                             except Exception:
+                                close_reason = "ws_send_fail"
                                 break
+                    except asyncio.CancelledError:
+                        close_reason = "cancelled"
+                        raise
                     except Exception as e:
+                        close_reason = f"{type(e).__name__}:{str(e)[:60]}"
                         print(f"relay: TLS read pump died: {type(e).__name__}: {e}",
                               flush=True)
                     finally:
@@ -356,7 +363,8 @@ async def run_once():
                             pass
                         try:
                             await ws.send(json.dumps({"type": "local_closed",
-                                                     "from": "tls_pump"}))
+                                                     "from": "tls_pump",
+                                                     "reason": close_reason}))
                         except Exception:
                             pass
 
