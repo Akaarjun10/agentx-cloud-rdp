@@ -27,6 +27,8 @@ Env: WORKER_URL (https://<name>.workers.dev), RELAY_SECRET.
 import asyncio
 import json
 import os
+import socket
+import ssl
 import sys
 
 try:
@@ -234,6 +236,9 @@ async def run_once():
         pump_task = None
         gen = 0  # attach generation; stale pumps must not signal local_closed
         awaiting_first_frame = False
+        tls_mode = False  # True when proxy terminated TLS (RDCleanPath browser flow)
+        tls_write_q = None
+        tls_writer_task = None
 
         async def _read_exactly(rdr, n: int) -> bytes:
             """Read exactly n bytes from the stream reader, looping as needed."""
@@ -266,6 +271,7 @@ async def run_once():
                         pass
 
         async def start_pump():
+            """Open TCP to the RDP server and start the pump (raw RDP mode)."""
             nonlocal reader, writer, pump_task, gen
             if writer is not None:
                 return True
@@ -290,7 +296,7 @@ async def run_once():
             RDP (CredSSP, MCS, etc.) over the WebSocket; the relay encrypts
             towards the server via the TLS socket.
             """
-            nonlocal reader, writer, pump_task, gen
+            nonlocal reader, writer, pump_task, gen, tls_mode, tls_write_q, tls_writer_task
             x224_req = fields["x224"]
             print("relay: RDCleanPath client detected, handshaking (proxy terminates TLS)",
                   flush=True)
@@ -319,8 +325,92 @@ async def run_once():
                 return False
             # Wrap the live TLS socket for asyncio: reads come back decrypted,
             # writes go out encrypted. Plain byte pump from here on.
+            #
+            # NOTE: asyncio.open_connection(sock=...) REFUSES SSLSocket
+            # ("TypeError: Socket cannot be of type SSLSocket"), so we drive
+            # the pre-handshaked SSLSocket directly with the event loop
+            # (add_reader + a write queue). Single-threaded, no locks.
             try:
-                reader, writer = await asyncio.open_connection(sock=tls_sock)
+                tls_sock.setblocking(False)
+                loop = asyncio.get_running_loop()
+                tls_write_q = asyncio.Queue()
+
+                def tls_cleanup():
+                    try:
+                        loop.remove_reader(tls_sock.fileno())
+                    except Exception:
+                        pass
+                    try:
+                        loop.remove_writer(tls_sock.fileno())
+                    except Exception:
+                        pass
+                    try:
+                        tls_sock.close()
+                    except Exception:
+                        pass
+                    try:
+                        tls_write_q.put_nowait(None)
+                    except Exception:
+                        pass
+
+                async def tls_notify_closed():
+                    try:
+                        await ws.send(json.dumps({"type": "local_closed"}))
+                    except Exception:
+                        pass
+
+                def on_tls_readable():
+                    try:
+                        data = tls_sock.recv(65536)
+                    except (ssl.SSLWantReadError, BlockingIOError):
+                        return
+                    except Exception as e:
+                        print(f"relay: TLS read failed: {e}", flush=True)
+                        tls_cleanup()
+                        asyncio.create_task(tls_notify_closed())
+                        return
+                    if not data:
+                        print("relay: TLS EOF from RDP server", flush=True)
+                        tls_cleanup()
+                        asyncio.create_task(tls_notify_closed())
+                    else:
+                        asyncio.create_task(ws.send(data))
+
+                async def tls_write_pump():
+                    while True:
+                        data = await tls_write_q.get()
+                        if data is None:
+                            return
+                        view = memoryview(data)
+                        while view:
+                            try:
+                                n = tls_sock.send(view)
+                                view = view[n:]
+                            except (ssl.SSLWantWriteError, BlockingIOError):
+                                fut = loop.create_future()
+
+                                def _on_writable():
+                                    if not fut.done():
+                                        fut.set_result(None)
+                                try:
+                                    loop.add_writer(tls_sock.fileno(), _on_writable)
+                                    await fut
+                                finally:
+                                    try:
+                                        loop.remove_writer(tls_sock.fileno())
+                                    except Exception:
+                                        pass
+                            except Exception as e:
+                                print(f"relay: TLS write failed: {e}", flush=True)
+                                tls_cleanup()
+                                asyncio.create_task(tls_notify_closed())
+                                return
+
+                loop.add_reader(tls_sock.fileno(), on_tls_readable)
+                tls_writer_task = asyncio.create_task(tls_write_pump())
+                # Remember TLS mode so client->server writes go to the queue.
+                writer = None
+                tls_mode = True
             except Exception as e:
                 print(f"relay: failed to wrap TLS socket: {e}", flush=True)
                 try:
@@ -368,8 +458,17 @@ async def run_once():
 
         async def detach():
             nonlocal reader, writer, pump_task, gen, awaiting_first_frame
+            nonlocal tls_mode, tls_write_q, tls_writer_task
             gen += 1  # invalidate the current pump's local_closed report
             awaiting_first_frame = False
+            tls_mode = False
+            if tls_writer_task is not None:
+                tls_writer_task.cancel()
+                tls_writer_task = None
+            tls_write_q = None
+            # Note: the TLS socket itself is closed by tls_cleanup() via
+            # remove_reader; if detach happens first, the reader callback
+            # will be removed when the socket is GC'd. Best effort here.
             if pump_task is not None:
                 pump_task.cancel()
                 pump_task = None
@@ -403,6 +502,12 @@ async def run_once():
                 if isinstance(msg, bytes):
                     if awaiting_first_frame:
                         await handle_first_frame(msg)
+                    elif tls_mode and tls_write_q is not None:
+                        try:
+                            tls_write_q.put_nowait(msg)
+                        except Exception as e:
+                            print(f"relay: client->rdp (TLS) write failed: "
+                                  f"{type(e).__name__}: {e}", flush=True)
                     elif writer is not None:
                         try:
                             writer.write(msg)
