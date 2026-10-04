@@ -370,6 +370,19 @@ async def run_once():
                         asyncio.create_task(tls_notify_closed())
                         return
                     if not data:
+                        # Empty read MIGHT be EOF, but with TLS 1.3 the server
+                        # can send post-handshake messages (NewSessionTicket)
+                        # that yield no application data. Verify with MSG_PEEK:
+                        # a truly closed connection peeks empty; otherwise
+                        # it's a spurious wakeup — keep the session alive.
+                        try:
+                            peek = tls_sock.recv(1, socket.MSG_PEEK)
+                        except (ssl.SSLWantReadError, BlockingIOError):
+                            return  # not EOF, just no app data yet
+                        except Exception:
+                            peek = b""
+                        if peek:
+                            return  # spurious; connection still alive
                         print("relay: TLS EOF from RDP server", flush=True)
                         tls_cleanup()
                         asyncio.create_task(tls_notify_closed())
