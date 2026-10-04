@@ -253,16 +253,30 @@ async def run_once():
             send it as a single WebSocket message, so the client's frame
             reader never sees a partial record ("not enough bytes").
             """
+            n_records = 0
+            n_bytes = 0
             try:
                 while True:
                     hdr = await _read_exactly(reader, 5)
                     rec_len = int.from_bytes(hdr[3:5], "big")
                     payload = await _read_exactly(reader, rec_len)
                     await ws.send(hdr + payload)
+                    n_records += 1
+                    n_bytes += 5 + rec_len
+                    if n_records == 1:
+                        # Header only (type|version|length); never log payloads.
+                        print(f"relay: TLS pump first record "
+                              f"type={hdr[0]} ver={hdr[1]:02x}{hdr[2]:02x} len={rec_len}",
+                              flush=True)
             except asyncio.CancelledError:
-                pass
-            except Exception:
-                pass
+                print(f"relay: TLS pump cancelled after {n_records} records / {n_bytes} bytes",
+                      flush=True)
+            except Exception as e:
+                # THIS is the diagnostic that matters: if the RDP server
+                # closes the TCP connection, the client sees EOF ("not enough
+                # bytes"). Log exactly why the pump died.
+                print(f"relay: TLS pump died after {n_records} records / {n_bytes} bytes: "
+                      f"{type(e).__name__}: {e}", flush=True)
             finally:
                 if my_gen == gen:
                     try:
@@ -303,8 +317,11 @@ async def run_once():
                 except Exception:
                     pass
                 return False
+            resp = build_rdcleanpath_response(x224_resp, cert_der)
+            print(f"relay: sending RDCleanPath response ({len(resp)} bytes, "
+                  f"x224 {len(x224_resp)} bytes, cert {len(cert_der)} bytes)", flush=True)
             try:
-                await ws.send(build_rdcleanpath_response(x224_resp, cert_der))
+                await ws.send(resp)
             except Exception as e:
                 print(f"relay: failed to send RDCleanPath response: {e}", flush=True)
                 return False
@@ -332,6 +349,8 @@ async def run_once():
             nonlocal awaiting_first_frame
             awaiting_first_frame = False
             fields = parse_rdcleanpath_request(data)
+            print(f"relay: first frame {len(data)} bytes, "
+                  f"rdcleanpath={'yes' if fields is not None else 'no'}", flush=True)
             if fields is not None:
                 await do_rdcleanpath(fields)
                 return
@@ -394,8 +413,9 @@ async def run_once():
                         try:
                             writer.write(msg)
                             await writer.drain()
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            print(f"relay: client->rdp write failed: "
+                                  f"{type(e).__name__}: {e}", flush=True)
                     continue
                 try:
                     ctl = json.loads(msg)
