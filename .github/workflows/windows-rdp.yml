@@ -145,14 +145,28 @@ jobs:
 
           while ((Get-Date) -lt $deadline) {
             Start-Sleep 60
-            # Every ~5 min, check liveness and surface into the workflow log.
-            if (((Get-Date) - $lastLogCheck).TotalSeconds -ge 300) {
+            # Every minute, check liveness and surface into the workflow log.
+            # (GitHub Actions reaps background processes when a step ends;
+            # revive the relay quickly so the uplink comes back.)
+            if (((Get-Date) - $lastLogCheck).TotalSeconds -ge 60) {
               $lastLogCheck = Get-Date
               $relayAlive = Test-RelayAlive $relayPid
-              Write-Host "[hold] relay alive=$relayAlive (pid $relayPid)"
-              if (-not $relayAlive) {
+              # Also verify the uplink is actually registered with the DO;
+              # the process can be alive while the WebSocket is dead.
+              $uplinkUp = $false
+              try {
+                $h = Invoke-RestMethod -Uri "$env:WORKER_URL/health" -TimeoutSec 10
+                $uplinkUp = ($h.rdp -eq $true)
+              } catch {}
+              Write-Host "[hold] relay alive=$relayAlive (pid $relayPid) uplink=$uplinkUp"
+              if (-not $relayAlive -or -not $uplinkUp) {
                 # GitHub Actions reaps background processes when a step ends;
                 # revive the relay so the uplink comes back.
+                # Kill any stale relay first so two don't fight over the DO.
+                if ($relayPid) { Stop-Process -Id $relayPid -Force -ErrorAction SilentlyContinue }
+                Get-Process python -ErrorAction SilentlyContinue | Where-Object {
+                  $_.CommandLine -like "*rdp_relay.py*"
+                } | Stop-Process -Force -ErrorAction SilentlyContinue
                 $relayPid = Start-Relay
                 Start-Sleep 15
                 $relayAlive = Test-RelayAlive $relayPid
