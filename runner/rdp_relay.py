@@ -335,11 +335,14 @@ async def run_once():
             try:
                 # Keep tls_sock in blocking mode (as returned by the handshake
                 # thread). Do NOT set non-blocking.
-                async def tls_read_pump():
+                async def tls_read_pump(pump_gen):
                     close_reason = "unknown"
                     try:
                         while True:
                             data = await asyncio.to_thread(tls_sock.recv, 65536)
+                            if pump_gen != gen:
+                                close_reason = "stale_gen"
+                                break
                             if not data:
                                 close_reason = "eof"
                                 print("relay: TLS EOF from RDP server", flush=True)
@@ -361,14 +364,18 @@ async def run_once():
                             tls_sock.close()
                         except Exception:
                             pass
-                        try:
-                            await ws.send(json.dumps({"type": "local_closed",
-                                                     "from": "tls_pump",
-                                                     "reason": close_reason}))
-                        except Exception:
-                            pass
+                        # Only report local_closed if this pump is still current.
+                        # Stale pumps (from a previous attach) must not kill the
+                        # new session.
+                        if pump_gen == gen:
+                            try:
+                                await ws.send(json.dumps({"type": "local_closed",
+                                                         "from": "tls_pump",
+                                                         "reason": close_reason}))
+                            except Exception:
+                                pass
 
-                tls_reader_task = asyncio.create_task(tls_read_pump())
+                # (Task is created after gen += 1 below, with the new generation.)
                 writer = None
                 tls_mode = True
                 # Store the tasks/sock so detach() can clean up.
@@ -388,6 +395,10 @@ async def run_once():
                 reader = writer = None
                 return False
             gen += 1
+            # Start the TLS read pump with the new generation. Stale pumps
+            # (from a previous attach) will see gen mismatch and exit quietly
+            # without sending local_closed.
+            tls_reader_task = asyncio.create_task(tls_read_pump(gen))
             # No asyncio pump_task for TLS mode; the tls_read_pump task owns it.
             # (pump_task stays None; detach() cancels tls_reader_task.)
             print("relay: RDCleanPath handshake done, session bridged (TLS terminated at relay)",
