@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html>
+<head><title>WS Binary Test</title></head>
+<body>
+<h1>WebSocket Binary Test</h1>
+<div id="log"></div>
+<script>
+const log = (msg) => {
+  document.getElementById('log').innerHTML += msg + '<br>';
+  console.log(msg);
+};
+
+async function test() {
+  const token = '9cb49c1cbd361ef80ac1e691448f293b7464c49f9da7b6004cb5bc4633ae5ff0';
+  const wsUrl = 'wss://agentx-rdp-relay.rdpbro.workers.dev/rdp-client?token=' + encodeURIComponent(token);
+  
+  log('Connecting to ' + wsUrl);
+  const ws = new WebSocket(wsUrl);
+  ws.binaryType = 'arraybuffer';
+  
+  ws.onopen = () => {
+    log('WS open!');
+    
+    // Build RDCleanPath request (DER)
+    // Simplified: version, destination, proxy_auth, x224
+    const x224 = new Uint8Array([0x03,0x00,0x00,0x13,0x0e,0xe0,0x00,0x00,0x00,0x00,0x00,0x01,0x00,0x08,0x00,0x03,0x00,0x00,0x00]);
+    log('X224 length: ' + x224.length);
+    
+    // Build DER manually (simplified)
+    // SEQUENCE {
+    //   [0] INTEGER 3390,
+    //   [2] UTF8String "127.0.0.1",
+    //   [3] UTF8String token,
+    //   [6] OCTET STRING x224
+    // }
+    function derLen(n) {
+      if (n < 0x80) return [n];
+      const b = [];
+      let tmp = n;
+      while (tmp > 0) { b.unshift(tmp & 0xFF); tmp >>= 8; }
+      return [0x80 | b.length, ...b];
+    }
+    function derTlv(tag, content) {
+      return [tag, ...derLen(content.length), ...content];
+    }
+    function utf8(s) { return Array.from(new TextEncoder().encode(s)); }
+    
+    const ver = derTlv(0xA0, derTlv(0x02, [0x0D, 0x3E]));
+    const dest = derTlv(0xA2, derTlv(0x0C, utf8("127.0.0.1")));
+    const auth = derTlv(0xA3, derTlv(0x0C, utf8(token)));
+    const x224tlv = derTlv(0xA6, derTlv(0x04, Array.from(x224)));
+    const seqContent = [...ver, ...dest, ...auth, ...x224tlv];
+    const req = new Uint8Array(derTlv(0x30, seqContent));
+    
+    log('Sending DER request (' + req.length + ' bytes)...');
+    ws.send(req);
+    log('Sent!');
+  };
+  
+  ws.onmessage = (ev) => {
+    log('Received message! Type: ' + (typeof ev.data));
+    if (ev.data instanceof ArrayBuffer) {
+      const bytes = new Uint8Array(ev.data);
+      log('Binary, length: ' + bytes.length);
+      log('First 10 bytes: ' + Array.from(bytes.slice(0,10)).map(b => b.toString(16).padStart(2,'0')).join(' '));
+      if (bytes.length === 796) {
+        log('SUCCESS! Got 796-byte response!');
+      } else if (bytes.length === 17) {
+        log('Got 17-byte ERROR response');
+      } else {
+        log('Unexpected length');
+      }
+    } else {
+      log('Text: ' + ev.data);
+    }
+  };
+  
+  ws.onerror = (e) => log('WS error: ' + e);
+  ws.onclose = (e) => log('WS closed: ' + e.code + ' ' + e.reason);
+}
+
+test();
+</script>
+</body>
+</html>
