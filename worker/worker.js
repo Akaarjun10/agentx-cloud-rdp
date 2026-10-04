@@ -40,8 +40,10 @@ export class RdpRelay {
     this.events = []; // TEMPORARY debug ring buffer (not persisted)
   }
 
-  logEvent(dir, kind, size) {
-    this.events.push({ t: Date.now(), dir, kind, size });
+  logEvent(dir, kind, size, content) {
+    const entry = { t: Date.now(), dir, kind, size };
+    if (content !== undefined) entry.msg = content;
+    this.events.push(entry);
     if (this.events.length > 60) this.events.shift();
   }
 
@@ -152,7 +154,8 @@ export class RdpRelay {
   onUplinkMessage(data) {
     const isBin = typeof data !== "string";
     this.logEvent("u2c", isBin ? "bin" : "txt",
-      isBin ? data.byteLength : data.length);
+      isBin ? data.byteLength : data.length,
+      isBin ? undefined : data.slice(0, 120));
     if (typeof data === "string") {
       let msg;
       try { msg = JSON.parse(data); } catch (e) { return; }
