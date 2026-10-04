@@ -127,8 +127,24 @@ jobs:
           $holdSeconds = 19000  # ~5h17m: leaves ~35min for snapshot + cache upload + dispatch
           $deadline = (Get-Date).AddSeconds($holdSeconds)
           $relayPid = Get-Content C:\rdp-state\relay.pid -ErrorAction SilentlyContinue
+          $lastLogCheck = Get-Date
           while ((Get-Date) -lt $deadline) {
-            Start-Sleep 300
+            Start-Sleep 60
+            # Every ~5 min, surface relay liveness into the workflow log.
+            if (((Get-Date) - $lastLogCheck).TotalSeconds -ge 300) {
+              $lastLogCheck = Get-Date
+              $relayAlive = $false
+              if ($relayPid) { $relayAlive = $null -ne (Get-Process -Id $relayPid -ErrorAction SilentlyContinue) }
+              Write-Host "[hold] relay alive=$relayAlive"
+              if (Test-Path C:\rdp-state\relay.log) {
+                Write-Host "[hold] relay.log tail:"
+                Get-Content C:\rdp-state\relay.log -Tail 5 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $_" }
+              }
+              if (Test-Path C:\rdp-state\relay.err.log) {
+                $err = Get-Content C:\rdp-state\relay.err.log -ErrorAction SilentlyContinue | Where-Object { $_ -match '\S' }
+                if ($err) { Write-Host "[hold] relay.err.log:"; $err | ForEach-Object { Write-Host "  $_" } }
+              }
+            }
             $relayAlive = $false
             if ($relayPid) { $relayAlive = $null -ne (Get-Process -Id $relayPid -ErrorAction SilentlyContinue) }
             $rdpUp = (Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue).TcpTestSucceeded
