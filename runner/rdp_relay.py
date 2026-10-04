@@ -198,8 +198,14 @@ async def _read_tpkt_async(reader) -> bytes:
 # ------------------------------------------------------------------ relay
 
 async def run_once():
+    # NOTE: websockets library ping/pong is DISABLED (ping_interval=None).
+    # Cloudflare DO WebSockets do not reliably answer ping frames, and a
+    # ping_timeout would falsely kill a healthy uplink. The relay's reconnect
+    # loop in main() handles real drops. A periodic application heartbeat
+    # below keeps the DO from going idle.
     async with websockets.connect(
-        RELAY_WS, max_size=64 * 1024 * 1024, ping_interval=20, ping_timeout=20
+        RELAY_WS, max_size=64 * 1024 * 1024, ping_interval=None, ping_timeout=None,
+        open_timeout=30,
     ) as ws:
         print("relay: connected to DO", flush=True)
 
@@ -325,6 +331,17 @@ async def run_once():
                     pass
                 reader = writer = None
 
+        async def heartbeat():
+            # Periodic liveness marker in the log + keeps the DO active.
+            # Runs until cancelled when run_once() exits.
+            try:
+                while True:
+                    await asyncio.sleep(60)
+                    print("relay: heartbeat (uplink alive)", flush=True)
+            except asyncio.CancelledError:
+                pass
+
+        hb_task = asyncio.create_task(heartbeat())
         try:
             async for msg in ws:  # single consumer: binary=data, text=control
                 if isinstance(msg, bytes):
@@ -348,6 +365,7 @@ async def run_once():
                     await detach()
                     print("relay: client detached", flush=True)
         finally:
+            hb_task.cancel()
             await detach()
 
 
@@ -356,8 +374,15 @@ async def main():
     while True:
         try:
             await run_once()
+            print("relay: uplink closed cleanly, reconnecting", flush=True)
         except Exception as e:
-            print(f"relay: uplink lost ({e}), retrying in {backoff}s", flush=True)
+            print(f"relay: uplink lost ({type(e).__name__}: {e}), retrying in {backoff}s",
+                  flush=True)
+        except BaseException as e:
+            # CancelledError/SystemExit etc: log and re-raise so the process
+            # does not silently spin.
+            print(f"relay: fatal ({type(e).__name__}: {e})", flush=True)
+            raise
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, 60)
 
