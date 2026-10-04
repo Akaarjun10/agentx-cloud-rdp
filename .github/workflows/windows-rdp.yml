@@ -128,14 +128,36 @@ jobs:
           $deadline = (Get-Date).AddSeconds($holdSeconds)
           $relayPid = Get-Content C:\rdp-state\relay.pid -ErrorAction SilentlyContinue
           $lastLogCheck = Get-Date
+
+          function Start-Relay {
+            Write-Host "[hold] (re)starting relay process"
+            $proc = Start-Process python -ArgumentList "runner/rdp_relay.py" `
+              -RedirectStandardOutput "C:\rdp-state\relay.log" `
+              -RedirectStandardError "C:\rdp-state\relay.err.log" `
+              -PassThru -WindowStyle Hidden
+            $proc.Id | Out-File -Encoding ascii C:\rdp-state\relay.pid
+            return $proc.Id
+          }
+          function Test-RelayAlive($pidToCheck) {
+            if (-not $pidToCheck) { return $false }
+            return $null -ne (Get-Process -Id $pidToCheck -ErrorAction SilentlyContinue)
+          }
+
           while ((Get-Date) -lt $deadline) {
             Start-Sleep 60
-            # Every ~5 min, surface relay liveness into the workflow log.
+            # Every ~5 min, check liveness and surface into the workflow log.
             if (((Get-Date) - $lastLogCheck).TotalSeconds -ge 300) {
               $lastLogCheck = Get-Date
-              $relayAlive = $false
-              if ($relayPid) { $relayAlive = $null -ne (Get-Process -Id $relayPid -ErrorAction SilentlyContinue) }
-              Write-Host "[hold] relay alive=$relayAlive"
+              $relayAlive = Test-RelayAlive $relayPid
+              Write-Host "[hold] relay alive=$relayAlive (pid $relayPid)"
+              if (-not $relayAlive) {
+                # GitHub Actions reaps background processes when a step ends;
+                # revive the relay so the uplink comes back.
+                $relayPid = Start-Relay
+                Start-Sleep 15
+                $relayAlive = Test-RelayAlive $relayPid
+                Write-Host "[hold] relay restarted, alive=$relayAlive (pid $relayPid)"
+              }
               if (Test-Path C:\rdp-state\relay.log) {
                 Write-Host "[hold] relay.log tail:"
                 Get-Content C:\rdp-state\relay.log -Tail 5 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $_" }
@@ -145,8 +167,7 @@ jobs:
                 if ($err) { Write-Host "[hold] relay.err.log:"; $err | ForEach-Object { Write-Host "  $_" } }
               }
             }
-            $relayAlive = $false
-            if ($relayPid) { $relayAlive = $null -ne (Get-Process -Id $relayPid -ErrorAction SilentlyContinue) }
+            $relayAlive = Test-RelayAlive $relayPid
             $rdpUp = (Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue).TcpTestSucceeded
             if (-not $relayAlive -and -not $rdpUp) {
               Write-Host "Relay and RDP both down — handing off to a successor now"
@@ -154,6 +175,9 @@ jobs:
             }
           }
           Write-Host "Hold complete, proceeding to snapshot"
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
 
       - name: Snapshot Chrome state
         shell: pwsh
