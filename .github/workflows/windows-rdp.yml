@@ -68,7 +68,7 @@ jobs:
           Write-Host "Tunnel: $url"
           $url | Out-File -Encoding ascii C:\rdp-state\tunnel.url
           # Publish URL for the browser page
-          $json = @{{ url = $url; updated = (Get-Date).ToUniversalTime().ToString("o") }} | ConvertTo-Json
+          $json = @{ url = $url; updated = (Get-Date).ToUniversalTime().ToString("o") } | ConvertTo-Json
           $json | Out-File -Encoding utf8 docs/tunnel-url.json
           git config user.name "agentx-bot"
           git config user.email "agentx-bot@users.noreply.github.com"
@@ -107,6 +107,6 @@ jobs:
       - name: Dispatch successor
         shell: pwsh
         run: |
-          $headers = @{{ Authorization = "Bearer ${{ secrets.GITHUB_TOKEN }}"; Accept = "application/vnd.github+json" }}
-          $body = @{{ ref = "${{ github.ref_name }}" }} | ConvertTo-Json
+          $headers = @{ Authorization = "Bearer ${{ secrets.GITHUB_TOKEN }}"; Accept = "application/vnd.github+json" }}
+          $body = @{ ref = "${{ github.ref_name }}" } | ConvertTo-Json
           Invoke-RestMethod -Method Post -Headers $headers -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/windows-rdp.yml/dispatches" -Body $body -ContentType "application/json"
