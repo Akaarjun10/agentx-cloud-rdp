@@ -134,7 +134,7 @@ jobs:
           $tunnelUrl = Get-Content C:\rdp-state\tunnel.url -ErrorAction SilentlyContinue
           while ((Get-Date) -lt $deadline) {
             Start-Sleep 45
-            $alive = Test-TunnelAlive $tunnelUrl
+            $alive = Test-TunnelAlive
             $rdpUp = (Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue).TcpTestSucceeded
             Write-Host "[hold] tunnel_alive=$alive rdp=$rdpUp url=$tunnelUrl"
             if (-not $rdpUp) { Write-Host "RDP down, handing off"; break }
