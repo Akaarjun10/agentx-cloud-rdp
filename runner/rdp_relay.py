@@ -30,6 +30,7 @@ import os
 import socket
 import ssl
 import sys
+import threading
 
 try:
     import websockets
@@ -333,8 +334,10 @@ async def run_once():
             # wakeups like with non-blocking + add_reader). SSLSocket is
             # full-duplex safe for one concurrent reader and one writer.
             try:
-                # Keep tls_sock in blocking mode (as returned by the handshake
-                # thread). Do NOT set non-blocking.
+                # The handshake leaves the socket non-blocking; for the
+                # thread-based pump we need BLOCKING mode (with no timeout).
+                # A blocking recv() returns empty ONLY on real EOF.
+                tls_sock.setblocking(True)
                 async def tls_read_pump(pump_gen):
                     close_reason = "unknown"
                     try:
