@@ -22,7 +22,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: C:\rdp-state\chrome-state.zip
-          key: rdp-chrome-${{{{ github.run_id }}}}
+          key: rdp-chrome-${{ github.run_id }}
           restore-keys: |
             rdp-chrome-
 
@@ -34,7 +34,7 @@ jobs:
         shell: pwsh
         run: ./runner/enable_rdp.ps1
         env:
-          RDP_PASSWORD: ${{{{ secrets.RDP_PASSWORD }}}}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
 
       - name: Launch Chrome
         shell: pwsh
@@ -102,11 +102,11 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: C:\rdp-state\chrome-state.zip
-          key: rdp-chrome-${{{{ github.run_id }}}}
+          key: rdp-chrome-${{ github.run_id }}
 
       - name: Dispatch successor
         shell: pwsh
         run: |
-          $headers = @{{ Authorization = "Bearer ${{{{ secrets.GITHUB_TOKEN }}}}"; Accept = "application/vnd.github+json" }}
-          $body = @{{ ref = "${{{{ github.ref_name }}}}" }} | ConvertTo-Json
-          Invoke-RestMethod -Method Post -Headers $headers -Uri "https://api.github.com/repos/${{{{ github.repository }}}}/actions/workflows/windows-rdp.yml/dispatches" -Body $body -ContentType "application/json"
+          $headers = @{{ Authorization = "Bearer ${{ secrets.GITHUB_TOKEN }}"; Accept = "application/vnd.github+json" }}
+          $body = @{{ ref = "${{ github.ref_name }}" }} | ConvertTo-Json
+          Invoke-RestMethod -Method Post -Headers $headers -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/windows-rdp.yml/dispatches" -Body $body -ContentType "application/json"
