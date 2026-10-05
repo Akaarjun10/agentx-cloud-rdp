@@ -95,14 +95,14 @@ def parse_rdcleanpath_request(data: bytes):
         return None
 
 
-def build_rdcleanpath_response(x224_resp: bytes, cert_der: bytes) -> bytes:
-    # SEQUENCE { [0] INTEGER version, [1] OCTET STRING x224, [2] OCTET STRING cert }
-    inner = (
-        _der_tlv(0xA0, _der_tlv(0x02, RDCLEANPATH_VERSION.to_bytes(2, "big")))
-        + _der_tlv(0xA1, _der_tlv(0x04, x224_resp))
-        + _der_tlv(0xA2, _der_tlv(0x04, cert_der))
-    )
-    return _der_tlv(0x30, inner)
+def build_rdcleanpath_response(x224_resp: bytes, cert_der: bytes,
+                              server_addr: str = "127.0.0.1") -> bytes:
+    """Build the proxy->client RDCleanPathPdu response (DER)."""
+    ver = _der_tlv(0xA0, _der_tlv(0x02, RDCLEANPATH_VERSION.to_bytes(2, "big")))
+    x224 = _der_tlv(0xA6, _der_tlv(0x04, x224_resp))
+    chain = _der_tlv(0xA7, _der_tlv(0x30, _der_tlv(0x04, cert_der)))
+    addr = _der_tlv(0xA9, _der_tlv(0x0C, server_addr.encode()))
+    return _der_tlv(0x30, ver + x224 + chain + addr)
 
 
 def build_rdcleanpath_error() -> bytes:
