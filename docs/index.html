@@ -286,6 +286,7 @@ $('connectBtn').addEventListener('click', async () => {
     sb.password(password);
     sb.destination('127.0.0.1');
     sb.proxyAddress(wsUrl);
+    sb.authToken('tunnel');
     sb.renderCanvas(canvas);
     sb.setCursorStyleCallbackContext(null);
     sb.setCursorStyleCallback(setCursor);
