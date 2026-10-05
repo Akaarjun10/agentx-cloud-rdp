@@ -45,10 +45,7 @@
   <div class="card">
     <h1>AgentX Cloud RDP</h1>
     <p class="sub">Your Windows desktop, right in the browser.</p>
-    <label>Worker URL</label>
-    <input id="workerUrl" value="https://agentx-rdp-relay.rdpbro.workers.dev" autocomplete="off">
-    <label>Client token</label>
-    <input id="token" type="password" placeholder="CLIENT_TOKEN" autocomplete="off">
+    <div id="tunnelInfo" style="font-size:12px;color:#8b93a7;margin:4px 0 8px;">Discovering tunnel…</div>
     <label>Username</label>
     <input id="username" value="runneradmin" autocomplete="off">
     <label>Password</label>
@@ -229,28 +226,41 @@ function errText(e) {
   return String(e);
 }
 
+// Fetch the current tunnel URL (published by the runner)
+async function getTunnelUrl() {
+  const r = await fetch('./tunnel-url.json?t=' + Date.now());
+  if (!r.ok) throw new Error('tunnel-url.json not found (HTTP ' + r.status + ')');
+  const j = await r.json();
+  if (!j.url) throw new Error('no tunnel URL registered yet');
+  return j.url;
+}
+
+// Auto-discover tunnel on page load
+let tunnelUrl = null;
+(async () => {
+  try {
+    tunnelUrl = await getTunnelUrl();
+    $('tunnelInfo').textContent = 'Tunnel: ' + tunnelUrl.replace('https://', '');
+  } catch (e) {
+    $('tunnelInfo').textContent = 'Tunnel offline — the Windows runner is not connected yet.';
+  }
+})();
+
 $('connectBtn').addEventListener('click', async () => {
   if (!wasmReady) { setStatus('RDP engine still loading…', true); return; }
-  const workerUrl = $('workerUrl').value.trim().replace(/\/$/, '');
-  const token = $('token').value.trim();
   const username = $('username').value.trim();
   const password = $('password').value;
-  if (!token) { setStatus('Enter the client token.', true); return; }
   if (!password) { setStatus('Enter the RDP password.', true); return; }
 
   $('connectBtn').disabled = true;
-
-  // Pre-check: is the Windows runner actually connected?
   setStatus('Checking backend…');
+
+  // (Re)fetch the tunnel URL in case it changed
   try {
-    const h = await (await fetch(workerUrl + '/health')).json();
-    if (!h.ok || !h.rdp) {
-      setStatus('Backend is offline — the Windows runner is not connected yet. Try again in a few minutes.', true);
-      $('connectBtn').disabled = false;
-      return;
-    }
+    tunnelUrl = await getTunnelUrl();
+    $('tunnelInfo').textContent = 'Tunnel: ' + tunnelUrl.replace('https://', '');
   } catch (e) {
-    setStatus('Cannot reach worker: ' + errText(e), true);
+    setStatus('Backend is offline — the Windows runner is not connected yet. Try again in a few minutes.', true);
     $('connectBtn').disabled = false;
     return;
   }
@@ -267,15 +277,15 @@ $('connectBtn').addEventListener('click', async () => {
 
   setStatus('Connecting…');
 
-  const wsUrl = workerUrl.replace(/^http/, 'ws') +
-    '/rdp-client?token=' + encodeURIComponent(token);
+  // Connect directly to the tunnel (WSS). The tunnel URL is unguessable;
+  // the RDP password authenticates the desktop session.
+  const wsUrl = tunnelUrl.replace(/^http/, 'ws');
   try {
     const sb = new ird.SessionBuilder();
     sb.username(username);
     sb.password(password);
     sb.destination('127.0.0.1');
     sb.proxyAddress(wsUrl);
-    sb.authToken(token);
     sb.renderCanvas(canvas);
     sb.setCursorStyleCallbackContext(null);
     sb.setCursorStyleCallback(setCursor);
