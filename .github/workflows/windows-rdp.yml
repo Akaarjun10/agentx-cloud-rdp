@@ -80,17 +80,56 @@ jobs:
       - name: Hold until handoff
         shell: pwsh
         run: |
+          function Start-BridgeTunnel {
+            Write-Host "[hold] Starting bridge..."
+            $b = Start-Process python -ArgumentList "runner/ws_rdp_bridge.py" -PassThru -WindowStyle Hidden
+            $b.Id | Out-File -Encoding ascii C:\rdp-state\bridge.pid
+            Start-Sleep 3
+            Write-Host "[hold] Starting tunnel..."
+            $t = Start-Process "C:\rdp-state\cloudflared.exe" -ArgumentList "tunnel --url http://127.0.0.1:8080 --no-autoupdate" -RedirectStandardError "C:\rdp-state\tunnel.err.log" -PassThru -WindowStyle Hidden
+            $t.Id | Out-File -Encoding ascii C:\rdp-state\tunnel.pid
+            $url = $null
+            for ($i=0; $i -lt 20; $i++) {
+              Start-Sleep 3
+              $log = Get-Content "C:\rdp-state\tunnel.err.log" -ErrorAction SilentlyContinue | Out-String
+              if ($log -match "https://[a-z0-9-]+\.trycloudflare\.com") { $url = $Matches[0]; break }
+            }
+            if ($url) {
+              $url | Out-File -Encoding ascii C:\rdp-state\tunnel.url
+              $json = @{ url = $url; updated = (Get-Date).ToUniversalTime().ToString("o") } | ConvertTo-Json
+              $json | Out-File -Encoding utf8 docs/tunnel-url.json
+              git add docs/tunnel-url.json
+              git commit -m "tunnel url refresh" 2>$null | Out-Null
+              git push 2>$null | Out-Null
+              Write-Host "[hold] Tunnel restarted: $url"
+              return $url
+            }
+            return $null
+          }
+          function Test-TunnelAlive($url) {
+            if (-not $url) { return $false }
+            try {
+              $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+              return $true
+            } catch {
+              # 530 or other error means tunnel is down
+              return $false
+            }
+          }
           $deadline = (Get-Date).AddSeconds(19000)
+          $tunnelUrl = Get-Content C:\rdp-state\tunnel.url -ErrorAction SilentlyContinue
           while ((Get-Date) -lt $deadline) {
-            Start-Sleep 60
-            $bAlive = $null -ne (Get-Process -Id (Get-Content C:\rdp-state\bridge.pid -ErrorAction SilentlyContinue) -ErrorAction SilentlyContinue)
-            $tAlive = $null -ne (Get-Process -Id (Get-Content C:\rdp-state\tunnel.pid -ErrorAction SilentlyContinue) -ErrorAction SilentlyContinue)
+            Start-Sleep 45
+            $alive = Test-TunnelAlive $tunnelUrl
             $rdpUp = (Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue).TcpTestSucceeded
-            Write-Host "[hold] bridge=$bAlive tunnel=$tAlive rdp=$rdpUp"
+            Write-Host "[hold] tunnel_alive=$alive rdp=$rdpUp url=$tunnelUrl"
             if (-not $rdpUp) { Write-Host "RDP down, handing off"; break }
-            if (-not $bAlive -or -not $tAlive) {
-              Write-Host "[hold] Restarting bridge/tunnel..."
-              # (simplified restart - full logic in repo)
+            if (-not $alive) {
+              Write-Host "[hold] Tunnel dead, restarting..."
+              Get-Content "C:\rdp-state\bridge.pid" -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
+              Get-Content "C:\rdp-state\tunnel.pid" -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
+              Start-Sleep 2
+              $tunnelUrl = Start-BridgeTunnel
             }
           }
 
