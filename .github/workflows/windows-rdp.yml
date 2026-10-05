@@ -53,6 +53,20 @@ jobs:
           $b = Start-Process python -ArgumentList "runner/ws_rdp_bridge.py" -PassThru -WindowStyle Hidden
           $b.Id | Out-File -Encoding ascii C:\rdp-state\bridge.pid
           Write-Host "Bridge PID $($b.Id)"
+          # Wait for bridge to listen on 8080
+          $bridgeUp = $false
+          for ($i=0; $i -lt 15; $i++) {
+            Start-Sleep 2
+            if ($b.HasExited) {
+              Write-Host "Bridge crashed! Logs:"
+              Get-Content "C:\rdp-state\bridge.err.log" -ErrorAction SilentlyContinue
+              throw "Bridge crashed on startup"
+            }
+            $tcp = (Test-NetConnection -ComputerName 127.0.0.1 -Port 8080 -WarningAction SilentlyContinue).TcpTestSucceeded
+            if ($tcp) { $bridgeUp = $true; break }
+          }
+          if (-not $bridgeUp) { throw "Bridge not on 8080" }
+          Write-Host "Bridge listening on 8080"
           $cfUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
           Invoke-WebRequest -Uri $cfUrl -OutFile "C:\rdp-state\cloudflared.exe"
           Write-Host "cloudflared downloaded"
