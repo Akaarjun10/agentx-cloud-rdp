@@ -120,15 +120,13 @@ jobs:
             }
             return $null
           }
-          function Test-TunnelAlive($url) {
-            if (-not $url) { return $false }
-            try {
-              $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
-              return $true
-            } catch {
-              # 530 or other error means tunnel is down
-              return $false
-            }
+          function Test-TunnelAlive() {
+            $bPid = Get-Content C:\rdp-state\bridge.pid -ErrorAction SilentlyContinue
+            $tPid = Get-Content C:\rdp-state\tunnel.pid -ErrorAction SilentlyContinue
+            $bAlive = $false; $tAlive = $false
+            if ($bPid) { $bAlive = $null -ne (Get-Process -Id $bPid.Trim() -ErrorAction SilentlyContinue) }
+            if ($tPid) { $tAlive = $null -ne (Get-Process -Id $tPid.Trim() -ErrorAction SilentlyContinue) }
+            return ($bAlive -and $tAlive)
           }
           $deadline = (Get-Date).AddSeconds(19000)
           $tunnelUrl = Get-Content C:\rdp-state\tunnel.url -ErrorAction SilentlyContinue
